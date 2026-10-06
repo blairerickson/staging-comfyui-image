@@ -1,0 +1,122 @@
+# DeepSeekVideoPromptExpander (PlaySpace) - local Ollama-first screenplay expander.
+# Rebuilt from spec (memory 2026-08-19/20) after original was lost with the Vast box.
+import os, json, urllib.request
+
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+DEEPSEEK_BASE = "https://api.deepseek.com/chat/completions"
+
+_GUIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_prompt_guide.txt")
+try:
+    DEFAULT_GUIDE = open(_GUIDE_PATH).read()
+except OSError:
+    DEFAULT_GUIDE = "You are a Prompt Architect for MiniMax T2VA. Output integrated_multimodal_description with [Shot] sections + timecodes, overall_soundscape, non_diegetic_music. No preamble, no markdown."
+
+
+def _frame_length(duration_seconds: float) -> int:
+    """Snap duration*24fps to the 17k+5 grid the H3 model expects (15s -> 362)."""
+    raw = int(round(duration_seconds * 24))
+    k = max(1, round((raw - 5) / 17))
+    return 17 * k + 5
+
+
+def _ollama_chat(model, system, user, temp, num_predict):
+    payload = {
+        "model": model, "stream": False,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "think": False,  # top-level: kills Qwen3 hidden-reasoning tokens
+        "options": {"num_ctx": 8192, "num_predict": num_predict, "temperature": temp},
+    }
+    req = urllib.request.Request(OLLAMA_BASE + "/api/chat", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        d = json.loads(r.read().decode())
+    return (d.get("message") or {}).get("content") or ""
+
+
+def _deepseek_chat(model, system, user, temp, num_predict):
+    key = os.environ.get("DEEPSEEK_API_KEY", "")
+    payload = {"model": model, "messages": [{"role": "system", "content": system},
+                                            {"role": "user", "content": user}],
+               "temperature": temp, "max_tokens": num_predict, "stream": False}
+    req = urllib.request.Request(DEEPSEEK_BASE, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        d = json.loads(r.read().decode())
+    return d["choices"][0]["message"]["content"]
+
+
+class DeepSeekVideoPromptExpander:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "style": ("STRING", {"multiline": True,
+                                     "default": "Style: A 90s direct-cable B-movie live action thriller movie cinema scene, film grain, dramatic lighting. Roger Corman."}),
+                "system_guide": ("STRING", {"multiline": True, "default": DEFAULT_GUIDE}),
+                "task_type": (["T2VA"], {"default": "T2VA"}),
+                "duration_seconds": ("FLOAT", {"default": 15, "min": 1, "max": 120, "step": 0.5}),
+                "last_shot_index": ("INT", {"default": 1, "min": 0}),
+                "model": ("STRING", {"default": "ps-promptwriter:latest"}),
+                "temperature": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "min_words": ("INT", {"default": 800, "min": 50, "max": 4000}),
+                "total_chunks": ("INT", {"default": 4, "min": 1, "max": 16}),
+                "chunk_index": ("INT", {"default": 1, "min": 1, "max": 16}),
+                "extra_notes": ("STRING", {"default": "", "multiline": True}),
+                "simple_prompt": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "optional": {
+                "story": ("STRING", {"forceInput": True}),
+                "previous_chunk": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("expanded_prompt", "frame_length")
+    FUNCTION = "expand"
+    CATEGORY = "PlaySpace/LLM"
+
+    def expand(self, style, system_guide, task_type, duration_seconds, last_shot_index,
+               model, temperature, min_words, total_chunks, chunk_index, extra_notes,
+               simple_prompt, story="", previous_chunk=""):
+        fl = _frame_length(duration_seconds)
+        story = (story or "").strip()
+        sp = (simple_prompt or "").strip()
+        if not story and sp:
+            story = sp  # simple_prompt text is the content to expand when no story given
+        user = (
+            f"Task: {task_type} | Chunk {chunk_index} of {total_chunks} | Duration: {duration_seconds}s "
+            f"| Frame length: {fl} | Min words: {min_words}\n"
+            f"Style: {style}\n"
+            + (f"Story: {story}\n" if story else "")
+            + f"Continue shot numbering from shot {last_shot_index}.\n"
+            + (f"Previous chunk (keep continuity):\n{previous_chunk}\n" if previous_chunk.strip() else "")
+            + (f"Additional notes: {extra_notes}\n" if extra_notes.strip() else "")
+        )
+        num_predict = max(128, min_words * 2)
+        # Ollama-first: prefer the local promptwriter model; fall back to DeepSeek
+        # (key present) only when Ollama is unavailable so the flow still completes.
+        try:
+            t0 = urllib.request.urlopen(OLLAMA_BASE + "/api/tags", timeout=5)
+            t0.read()
+            t0.close()
+            ollama_up = True
+        except Exception:
+            ollama_up = False
+        if ollama_up:
+            try:
+                out = _ollama_chat(model, system_guide, user, temperature, num_predict)
+            except Exception as e:
+                out = f"ERROR (Ollama {OLLAMA_BASE}): {e}"
+        elif os.environ.get("DEEPSEEK_API_KEY"):
+            try:
+                out = _deepseek_chat(model, system_guide, user, temperature, num_predict)
+            except Exception as e:
+                out = f"ERROR (DeepSeek): {e}"
+        else:
+            out = (f"ERROR: no prompt backend available. Ollama down at {OLLAMA_BASE} "
+                   f"and no DEEPSEEK_API_KEY set.")
+        return out, fl
+
+
+NODE_CLASS_MAPPINGS = {"DeepSeekVideoPromptExpander": DeepSeekVideoPromptExpander}
+NODE_DISPLAY_NAME_MAPPINGS = {"DeepSeekVideoPromptExpander": "DeepSeek Video Prompt Expander (Ollama)"}
