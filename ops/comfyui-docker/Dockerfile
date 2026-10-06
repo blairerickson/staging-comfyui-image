@@ -12,7 +12,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.12 python3.12-venv python3-pip \
+        python3.12 python3.12-venv python3.12-dev python3-pip \
+        build-essential \
         git git-lfs tmux ffmpeg aria2 curl \
         ca-certificates wget && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -24,11 +25,29 @@ RUN /root/venv/bin/pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu128 \
     torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
 
+# Staging renders on RTX PRO 6000 / 5090 Blackwell, i.e. compute capability 12.0.
+# Pinning the arch keeps the CI build down to a single target and lets sageattention
+# pick its gencode flags from the env instead of probing for a local GPU, which the
+# Actions runner does not have.
+ENV TORCH_CUDA_ARCH_LIST=12.0 \
+    EXT_PARALLEL=1 \
+    MAX_JOBS=4
+
 RUN git clone https://github.com/thu-ml/sageattention.git /tmp/sageattention && \
     cd /tmp/sageattention && git checkout d1a57a5 && \
-    /root/venv/bin/pip install --no-cache-dir . && \
-    cd sageattention3_blackwell && /root/venv/bin/pip install --no-cache-dir . && \
-    rm -rf /tmp/sageattention
+    # Both setup.py files import torch at module scope, so PEP 517 build isolation
+    # has to be off — the isolated env has no torch. That means their build deps
+    # must already be in the venv, at the versions pyproject.toml asks for.
+    /root/venv/bin/pip install --no-cache-dir \
+        "setuptools>=62,<75" "wheel>=0.38,<0.44" "packaging>=21,<24" ninja && \
+    /root/venv/bin/pip install --no-cache-dir --no-build-isolation . && \
+    # sageattention3_blackwell reads the arch straight off a local GPU and has no
+    # TORCH_CUDA_ARCH_LIST path, so pin it to sm_120 for the build.
+    cd sageattention3_blackwell && \
+    sed -i 's/^    cc_major, cc_minor = torch\.cuda\.get_device_capability()$/    cc_major, cc_minor = (12, 0)  # pinned: no GPU on the build host/' setup.py && \
+    grep -q 'cc_major, cc_minor = (12, 0)' setup.py && \
+    /root/venv/bin/pip install --no-cache-dir --no-build-isolation . && \
+    cd / && rm -rf /tmp/sageattention
 
 COPY ops/comfyui-docker/requirements.txt /tmp/requirements.txt
 RUN /root/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && \

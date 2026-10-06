@@ -17,11 +17,22 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # The CUDA devel base plus torch plus the compiled sageattention kernels do
+      # not fit in the ~21 GB a stock runner leaves free.
+      - name: Free up runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force || true
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
